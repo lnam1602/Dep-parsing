@@ -40,6 +40,8 @@ def train_epoch(model, dataloader, optimizer, device):
             batch["attention_mask"],
             batch["word_starts"],
             batch["word_mask"],
+            upos_ids=batch.get("upos_ids"),
+            char_ids=batch.get("char_ids"),
         )
         loss = compute_loss(arc_scores, rel_scores, batch["heads"], batch["labels"], batch["word_mask"])
         loss.backward()
@@ -51,7 +53,7 @@ def train_epoch(model, dataloader, optimizer, device):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, use_mst: bool = False):
     model.eval()
     total_loss = 0.0
     total_correct_arcs = 0.0
@@ -65,9 +67,15 @@ def evaluate(model, dataloader, device):
             batch["attention_mask"],
             batch["word_starts"],
             batch["word_mask"],
+            upos_ids=batch.get("upos_ids"),
+            char_ids=batch.get("char_ids"),
         )
         loss = compute_loss(arc_scores, rel_scores, batch["heads"], batch["labels"], batch["word_mask"])
-        metrics = attachment_scores(arc_scores, rel_scores, batch["heads"], batch["labels"], batch["word_mask"])
+        metrics = attachment_scores(
+            arc_scores, rel_scores,
+            batch["heads"], batch["labels"], batch["word_mask"],
+            use_mst=use_mst,
+        )
 
         token_count = batch["word_mask"].sum().item()
         total_loss += loss.item()

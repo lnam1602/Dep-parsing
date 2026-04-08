@@ -66,3 +66,16 @@ def build_label_vocab(sentences):
     label2id = {label: idx for idx, label in enumerate(labels)}
     id2label = {idx: label for label, idx in label2id.items()}
     return label2id, id2label
+
+
+def build_upos_vocab(sentences):
+    """Build upos2id / id2upos from training sentences.
+    Index 0 is reserved for <PAD> (used for the virtual ROOT token).
+    Index 1 is reserved for <UNK>.
+    """
+    tags = sorted({tag for sentence in sentences for tag in sentence["upos"]})
+    special = ["<PAD>", "<UNK>"]
+    all_tags = special + [t for t in tags if t not in special]
+    upos2id = {tag: idx for idx, tag in enumerate(all_tags)}
+    id2upos = {idx: tag for tag, idx in upos2id.items()}
+    return upos2id, id2upos
