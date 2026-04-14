@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from transformers import get_linear_schedule_with_warmup
 
 from src.dataset.char_vocab import build_char_vocab
 from src.dataset.conllu_reader import build_label_vocab, build_upos_vocab, read_conllu
@@ -24,7 +25,7 @@ def parse_args():
     # Differential learning rates 
     parser.add_argument("--bert-lr", type=float, default=2e-5,
                         help="Learning rate for PhoBERT encoder parameters.")
-    parser.add_argument("--head-lr", type=float, default=1e-3,
+    parser.add_argument("--head-lr", type=float, default=2e-4,
                         help="Learning rate for task-head parameters (MLP, biaffine, embeddings).")
     parser.add_argument("--lr", type=float, default=None,
                         help="Legacy: set the same LR for all parameters.")
@@ -35,6 +36,12 @@ def parse_args():
     parser.add_argument("--save-path", type=Path, default=Path("checkpoints/best.pt"))
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--min-delta", type=float, default=0.0)
+    parser.add_argument("--warmup-ratio", type=float, default=0.1,
+                        help="Fraction of total steps used for linear LR warmup (0 = no warmup).")
+    parser.add_argument("--label-smoothing", type=float, default=0.1,
+                        help="Label smoothing epsilon for cross-entropy loss (0 = disabled).")
+    parser.add_argument("--max-grad-norm", type=float, default=5.0,
+                        help="Max gradient norm for clipping (0 = disabled).")
     # MST decoding at eval time 
     parser.add_argument("--use-mst", action="store_true", default=False,
                         help="Use Chu-Liu/Edmonds MST decoding during evaluation.")
@@ -138,6 +145,16 @@ def main():
             {"params": head_params, "lr": args.head_lr},
         ])
 
+    # LR scheduler: linear warmup then linear decay to 0
+    total_steps = args.epochs * len(train_loader)
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    ) if warmup_steps > 0 or total_steps > 0 else None
+    print(f"Scheduler: total_steps={total_steps}, warmup_steps={warmup_steps}")
+
     # TensorBoard
     writer = None
     if args.log_dir:
@@ -159,16 +176,27 @@ def main():
     best_las = -1.0
     best_epoch = 0
     epochs_without_improvement = 0
+    best_dev_loss = float("inf")
+    epochs_loss_rising = 0
+    loss_patience = max(2, args.patience // 2)
     args.save_path.parent.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_epoch(model, train_loader, optimizer, device)
+        train_metrics = train_epoch(
+            model, train_loader, optimizer, device,
+            scheduler=scheduler,
+            max_grad_norm=args.max_grad_norm,
+            label_smoothing=args.label_smoothing,
+        )
+        train_loss = train_metrics["loss"]
+        grad_norm  = train_metrics["grad_norm"]
         dev_metrics = evaluate(model, dev_loader, device, use_mst=args.use_mst)
         print(
             f"Epoch {epoch}: train_loss={train_loss:.4f} "
             f"dev_loss={dev_metrics['loss']:.4f} "
             f"dev_uas={dev_metrics['uas']:.4f} "
-            f"dev_las={dev_metrics['las']:.4f}"
+            f"dev_las={dev_metrics['las']:.4f} "
+            f"grad_norm={grad_norm:.2f}"
         )
 
         if writer:
@@ -176,6 +204,7 @@ def main():
             writer.add_scalar("Loss/dev",   dev_metrics["loss"], epoch)
             writer.add_scalar("UAS/dev",    dev_metrics["uas"],  epoch)
             writer.add_scalar("LAS/dev",    dev_metrics["las"],  epoch)
+            writer.add_scalar("GradNorm",   grad_norm,           epoch)
 
         if use_wandb:
             wandb.log({
@@ -183,6 +212,7 @@ def main():
                 "dev_loss":   dev_metrics["loss"],
                 "dev_uas":    dev_metrics["uas"],
                 "dev_las":    dev_metrics["las"],
+                "grad_norm":  grad_norm,
             }, step=epoch)
 
         if dev_metrics["las"] > best_las + args.min_delta:
@@ -211,6 +241,19 @@ def main():
                     f"Best epoch={best_epoch}, best_dev_las={best_las:.4f}"
                 )
                 break
+
+        # Secondary stop: dev loss diverging while LAS is stagnating
+        if dev_metrics["loss"] > best_dev_loss:
+            epochs_loss_rising += 1
+        else:
+            best_dev_loss = dev_metrics["loss"]
+            epochs_loss_rising = 0
+        if epochs_loss_rising >= loss_patience and epochs_without_improvement >= 1:
+            print(
+                f"Early stopping at epoch {epoch}: dev loss rose for {epochs_loss_rising} consecutive epochs "
+                f"with no LAS improvement. Best epoch={best_epoch}, best_dev_las={best_las:.4f}"
+            )
+            break
 
     if writer:
         writer.close()
